@@ -1,8 +1,8 @@
 _FILENAME=${0##*/}
 CUR_DIR=${0/${_FILENAME}}
 CUR_DIR=$(cd $(dirname ${CUR_DIR}); pwd)/$(basename ${CUR_DIR})/
-FLAGS=-flto -O3 -std=gnu11 -fno-stack-protector -ffunction-sections -fdata-sections -Wl,--gc-sections -lm
-DEFS=-DNDEBUG
+FLAGS="-flto -O3 -std=gnu11 -fno-stack-protector -ffunction-sections -fdata-sections -Wl,--gc-sections -lm"
+DEFS="-DNDEBUG"
 
 pushd $CUR_DIR/..
 

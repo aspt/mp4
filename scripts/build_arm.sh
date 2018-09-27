@@ -1,8 +1,8 @@
 _FILENAME=${0##*/}
 CUR_DIR=${0/${_FILENAME}}
 CUR_DIR=$(cd $(dirname ${CUR_DIR}); pwd)/$(basename ${CUR_DIR})/
-FLAGS=-static -mcpu=cortex-a8 -mfpu=neon -mfloat-abi=hard -flto -O3 -std=gnu11 -ffast-math -fomit-frame-pointer -ftree-vectorize -lm
-DEFS=-DNDEBUG
+FLAGS=-"static -mcpu=cortex-a8 -mfpu=neon -mfloat-abi=hard -flto -O3 -std=gnu11 -ffast-math -fomit-frame-pointer -ftree-vectorize -lm"
+DEFS="-DNDEBUG"
 
 pushd $CUR_DIR/..
 

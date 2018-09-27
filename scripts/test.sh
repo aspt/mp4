@@ -69,7 +69,7 @@ rm mp4mux_file.mp4
 rm transcoded.mp4
 
 
-qemu-arm  ./mp4mux_stream_arm_gcc mp4mux_stream.mp4
+qemu-arm ./mp4mux_stream_arm_gcc mp4mux_stream.mp4
 if ! cmp ./mp4mux_stream.mp4 vectors/ref/mp4mux_stream.mp4 >/dev/null 2>&1
 then
     echo test failed
