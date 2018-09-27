@@ -1,3 +1,5 @@
+[![Build Status](https://travis-ci.org/aspt/mp4.svg)](https://travis-ci.org/aspt/mp4)
+
 Minimalistic MP4 muxer & demuxer
 
 MP4 muxer features:
