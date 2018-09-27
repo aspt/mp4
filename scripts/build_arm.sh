@@ -9,4 +9,4 @@ pushd $CUR_DIR/..
 gcc ${FLAGS} ${DEFS} -o mp4mux_stream_arm_gcc  src/mp4mux.c  -Dmp4mux_test -DMP4E_CAN_USE_RANDOM_FILE_ACCESS=0
 gcc ${FLAGS} ${DEFS} -o mp4mux_file_arm_gcc  src/mp4mux.c -Dmp4mux_test -DMP4E_CAN_USE_RANDOM_FILE_ACCESS=1
 gcc ${FLAGS} ${DEFS} -o mp4demux_arm_gcc  src/mp4demux.c   -Dmp4demux_test
-gcc ${FLAGS} ${DEFS} -o mp4transcode_test_arm_gcc  test/mp4transcode_test.c src/mp4mux.c src/mp4demux.c -Isrc
+gcc ${FLAGS} ${DEFS} -o mp4transcode_arm_gcc  test/mp4transcode_test.c src/mp4mux.c src/mp4demux.c -Isrc
