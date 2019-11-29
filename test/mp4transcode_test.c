@@ -18,7 +18,8 @@ int transcode(int argc, char* argv[])
 {
     unsigned i, ntrack = 0;
     int ninput;
-    MP4E_mux_t * mux =  MP4E__open(fopen("transcoded.mp4", "wb"));
+    int fragmentation_mode = 0;
+    MP4E_mux_t * mux = MP4E__open(fopen("transcoded.mp4", "wb"), fragmentation_mode);
 
     for (ninput = 0; ninput < 2; ninput++)
     {

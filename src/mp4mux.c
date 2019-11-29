@@ -2,6 +2,26 @@
 *
 *   Ref: [1] ISO/IEC 14496-12:2005
 *
+    Option 1: simple mp4 layout, when fseek() available:
+
+        [MDAT]<interleaved a/v frames, in any order> [MOOV]<Stream description & data index>
+
+        A/V data written in single huge MDAT box. fseek() needed to update size of the MDAT box.
+    
+
+    Option 2: simple mp4 layout, when fseek() NOT available:
+
+        [MDAT]<media frame> [MDAT]<media frame> .... [MDAT]<media frame> [MOOV]<Stream description & data index>
+    
+        Each A/V frame written in it's MDAT box
+
+    Options 3&4: fragmented mp4 layout:
+
+        [MOOV]<Stream description> [MOOF][MDAT]<media frame>[MOOF][MDAT]<media frame> .... [MOOF][MDAT]<media frame>
+
+        Each A/V frame written in it's MDAT box. Frame side info written in MOOF box before. There is no global index in this file
+        If fseek() available, media duration in the stream description is updated when closing the file
+
 **/      
 #include "mp4mux.h"
 #include <assert.h>
@@ -13,7 +33,7 @@
 /************************************************************************/
 // if fseek() avaialable, use single MDAT atom per file, and update data size on close
 #ifndef MP4E_CAN_USE_RANDOM_FILE_ACCESS
-#define MP4E_CAN_USE_RANDOM_FILE_ACCESS    0
+#define MP4E_CAN_USE_RANDOM_FILE_ACCESS   1
 #endif
 
 // How much memory needed for indexes
@@ -74,10 +94,8 @@ typedef struct MP4E_mux_tag
     FILE * mp4file;                 // output file handle
     mp4e_size_t write_pos;          // ## of bytes written ~ current file position (until 1st fseek)
     char * text_comment;            // application-supplied file comment
-
-#if MP4E_CAN_USE_RANDOM_FILE_ACCESS
-    mp4e_size_t mdat_start;         // MDAT box start position
-#endif
+    int enable_fragmentation;         // flag, indicating streaming-friendly 'fragmentation' mode
+    int fragments_count;            // # of fragments in 'fragmentation' mode
 } MP4E_mux_t;
 
 
@@ -106,6 +124,8 @@ typedef struct MP4E_mux_tag
 // Atom with 'FullAtomVersionFlags' field
 #define MP4_FULL_ATOM(x, flag)  MP4_ATOM(x); WR4(flag);
 
+
+static int mp4e_write_index(MP4E_mux_t * mux);
 
 /************************************************************************/
 /*      File output (non-portable) stuff                                */
@@ -182,9 +202,8 @@ static unsigned char * asp_vector_put(asp_vector_t * h, const void * buf, int by
     return tail;
 }
 
-
 /************************************************************************/
-/*      Exported API functions                                          */
+/*  Index data structure managment functions                            */
 /************************************************************************/
 
 /**
@@ -204,91 +223,9 @@ static void mp4e_free(MP4E_mux_t * mux)
         }
         asp_vector_reset(&mux->tracks);
         fclose(mux->mp4file);
+        free(mux->text_comment);
         free(mux);
     }
-}
-
-/**
-*   Allocates and initialize mp4 multiplexer
-*   return multiplexer handle on success; NULL on failure
-*/
-MP4E_mux_t * MP4E__open(FILE * mp4file)
-{
-    // hardcoded part of the file header
-    static const unsigned char mp4e_box_ftyp[] = 
-    {
-#if 1
-        0,0,0,0x18,'f','t','y','p',
-        'm','p','4','2',0,0,0,0,
-        'm','p','4','2','i','s','o','m', 
-#else
-        // as in ffmpeg
-        0,0,0,0x20,'f','t','y','p',
-        'i','s','o','m',0,0,2,0,
-        'm','p','4','1','i','s','o','m', 
-        'i','s','o','2','a','v','c','1', 
-#endif
-    };
-
-    MP4E_mux_t * mux;
-    if (!mp4file)
-    {
-        return NULL;
-    }
-
-    mux = (MP4E_mux_t *)calloc(sizeof(MP4E_mux_t), 1);
-    if (mux)
-    {
-        int success;
-        mux->mp4file = mp4file;
-        asp_vector_init(&mux->tracks, 2*sizeof(track_t));
-
-        // Write fixed header: 'ftyp' box
-        success = (int)mp4e_fwrite(mux, mp4e_box_ftyp, sizeof(mp4e_box_ftyp));
-
-#if MP4E_CAN_USE_RANDOM_FILE_ACCESS
-        // Save position, which would be updated with mdat box size
-        mux->mdat_start = mux->write_pos;
-
-        // Write filler, which would be updated later
-        success &= mp4e_fwrite(mux, mp4e_box_ftyp, 8);
-#endif
-        if (!success) 
-        {
-            mp4e_free(mux);
-            mux = NULL;
-        }
-    }
-
-    return mux;
-}
-
-/**
-*   Add new track, return track ID
-*/
-int MP4E__add_track(MP4E_mux_t * mux, const MP4E_track_t * track_data)
-{
-    track_t *tr;
-
-    if (!mux || !track_data)
-    {
-        return MP4E_STATUS_BAD_ARGUMENTS;
-    }
-
-    tr = (track_t*)asp_vector_alloc_tail(&mux->tracks, sizeof(track_t));
-    if (!tr) 
-    {
-        return MP4E_STATUS_NO_MEMORY;
-    }
-    memset(tr, 0, sizeof(track_t));
-    memcpy(&tr->info, track_data, sizeof(*track_data));
-    if (!asp_vector_init(&tr->smpl, 256))
-    {
-        return MP4E_STATUS_NO_MEMORY;
-    }
-    asp_vector_init(&tr->vsps, 0);
-    asp_vector_init(&tr->vpps, 0);
-    return (int)(mux->tracks.bytes / sizeof(track_t)) - 1;
 }
 
 /**
@@ -331,41 +268,6 @@ static int mp4e_sps_pps_items_count(asp_vector_t * v)
 }
 
 /**
-*   Set track DSI. Used for audio tracks.
-*/
-int MP4E__set_dsi(MP4E_mux_t * mux, int track_id, const void * dsi, int bytes)
-{
-    track_t* tr = ((track_t*)mux->tracks.data) + track_id;
-    assert(tr->info.track_media_kind == e_audio ||
-           tr->info.track_media_kind == e_private);
-    if (tr->vsps.bytes)
-    {
-        return MP4E_STATUS_ONLY_ONE_DSI_ALLOWED;   // only one DSI allowed
-    }
-    return mp4e_sps_pps_append_mem(&tr->vsps, dsi, bytes) ? MP4E_STATUS_OK : MP4E_STATUS_NO_MEMORY;
-}
-
-/**
-*   Set track SPS. Used for AVC video tracks.
-*/
-int MP4E__set_sps(MP4E_mux_t * mux, int track_id, const void * sps, int bytes)
-{
-    track_t* tr = ((track_t*)mux->tracks.data) + track_id;
-    assert(tr->info.track_media_kind == e_video);
-    return mp4e_sps_pps_append_mem(&tr->vsps, sps, bytes) ? MP4E_STATUS_OK : MP4E_STATUS_NO_MEMORY;
-}
-
-/**
-*   Set track PPS. Used for AVC video tracks.
-*/
-int MP4E__set_pps(MP4E_mux_t * mux, int track_id, const void * pps, int bytes)
-{
-    track_t* tr = ((track_t*)mux->tracks.data) + track_id;
-    assert(tr->info.track_media_kind == e_video);
-    return mp4e_sps_pps_append_mem(&tr->vpps, pps, bytes) ? MP4E_STATUS_OK : MP4E_STATUS_NO_MEMORY;
-}
-
-/**
 *   Return sum of track samples duration.
 */
 static unsigned mp4e_get_track_duration(const track_t * tr)
@@ -377,6 +279,16 @@ static unsigned mp4e_get_track_duration(const track_t * tr)
         sum_duration += s[i].duration;
     }
     return sum_duration;
+}
+
+/**
+*   calculate size of length field of OD box
+*/
+static int mp4e_od_size_of_size(int size)
+{
+    int i, size_of_size = 1;
+    for (i = size; i > 0x7F; i -= 0x7F) size_of_size++;
+    return size_of_size;
 }
 
 /**
@@ -392,86 +304,142 @@ static int mp4e_add_sample_descriptor(MP4E_mux_t * mux, track_t * tr, int data_b
     return NULL != asp_vector_put(&tr->smpl, &smp, sizeof(sample_t));
 }
 
-/**
-*   Add new sample to specified track
-*/
-int MP4E__put_sample(MP4E_mux_t * mux, int track_num, const void * data, int data_bytes, int duration, int kind)
-{
-    track_t * tr;
-    if (!mux || !data || track_num*sizeof(track_t) >= mux->tracks.bytes)
-    {
-        return MP4E_STATUS_BAD_ARGUMENTS;
-    }
-    tr = ((track_t*)mux->tracks.data) + track_num;
+/************************************************************************/
+/*  Data write functions                                                */
+/************************************************************************/
 
-#if !MP4E_CAN_USE_RANDOM_FILE_ACCESS
+/**
+*    Write fixed file header: 'ftyp' box
+*/
+static int mp4e_write_file_header(MP4E_mux_t * mux)
+{
+    // hardcoded part of the file header
+    static const unsigned char mp4e_box_ftyp[] = 
     {
-        // Write each sample to a separate atom
-        unsigned char write_base[8], *write_ptr = write_base;     // for WR4 macro
-        WR4(data_bytes + 8);
-        WR4(BOX_mdat);
-        if (!mp4e_fwrite(mux, write_base, write_ptr - write_base))
-        {
-            return MP4E_STATUS_FILE_WRITE_ERROR;
-        }
-    }
+#if 1
+        0,0,0,0x18,'f','t','y','p',
+        'm','p','4','2',0,0,0,0,
+        'm','p','4','2','i','s','o','m', 
+#else
+        // as in ffmpeg
+        0,0,0,0x20,'f','t','y','p',
+        'i','s','o','m',0,0,2,0,
+        'm','p','4','1','i','s','o','m', 
+        'i','s','o','2','a','v','c','1', 
 #endif
-
-    if (!mp4e_add_sample_descriptor(mux, tr, data_bytes, duration, kind))
-    {
-        return MP4E_STATUS_NO_MEMORY;
-    }
-
-    if (!mp4e_fwrite(mux, data, data_bytes))
-    {
-        return MP4E_STATUS_FILE_WRITE_ERROR;
-    }
-
-    return MP4E_STATUS_OK;
+    };
+    return mp4e_fwrite(mux, mp4e_box_ftyp, sizeof(mp4e_box_ftyp)) ? sizeof(mp4e_box_ftyp) : 0;
 }
 
 /**
-*   calculate size of length field of OD box
+*   Write data header: 'mdat' box 
 */
-static int mp4e_od_size_of_size(int size)
+static int mp4e_write_mdat_box(MP4E_mux_t * mux, unsigned data_bytes)
 {
-    int i, size_of_size = 1;
-    for (i = size; i > 0x7F; i -= 0x7F) size_of_size++;
-    return size_of_size;
+    unsigned char write_base[8], *write_ptr = write_base;     // for WR4 macro
+    WR4(data_bytes);
+    WR4(BOX_mdat);
+    return mp4e_fwrite(mux, write_base, write_ptr - write_base);
 }
 
 /**
-*   Add or remove MP4 file text comment according to Apple specs:
-*   https://developer.apple.com/library/mac/documentation/QuickTime/QTFF/Metadata/Metadata.html#//apple_ref/doc/uid/TP40000939-CH1-SW1
-*   http://atomicparsley.sourceforge.net/mpeg-4files.html
-*   note that ISO did not specify comment format.
+*   Write Movie Fragment: 'moof' box 
 */
-int MP4E__set_text_comment(MP4E_mux_t * mux, const char * comment)
+static int mp4e_write_fragment_header(MP4E_mux_t * mux, int track_num, int data_bytes, int duration, int kind)
 {
-    if (!mux)
+    unsigned char write_base[888], *write_ptr = write_base;     // for WRITE_4 macro
+    // atoms nesting stack
+    unsigned char * stack_base[20];
+    unsigned char ** stack = stack_base;
+    unsigned flags;
+    unsigned char * pdata_offset;
+    enum 
     {
-        return MP4E_STATUS_BAD_ARGUMENTS;
-    }
-    // replace comment
-    free(mux->text_comment);
-    mux->text_comment = NULL;
-    if (comment)
-    {
-        size_t comment_size = strlen(comment) + 1;
-        mux->text_comment = (char*)malloc(comment_size);
-        if (mux->text_comment)
-        {
-            memcpy(mux->text_comment, comment, comment_size);
-        }
+        default_sample_duration_present = 0x000008,
+        default_sample_flags_present = 0x000020,
+    } e;
 
-    }
-    return MP4E_STATUS_OK;
+    track_t * tr = ((track_t*)mux->tracks.data) + track_num;
+
+    MP4_ATOM(BOX_moof)
+        MP4_FULL_ATOM(BOX_mfhd, 0)
+            WR4(mux->fragments_count);  // start from 1
+        MP4_END_ATOM
+        MP4_ATOM(BOX_traf)
+            flags = 0;
+            if (tr->info.track_media_kind == e_video) 
+            {
+                flags |= 0x20;          // default-sample-flags-present 
+            }
+            else
+            {
+                flags |= 0x08;          // default-sample-duration-present 
+            }
+            flags =  (tr->info.track_media_kind == e_video) ? 0x20020 : 0x20008;
+
+            MP4_FULL_ATOM(BOX_tfhd, flags)
+                WR4(track_num+1);       // track_ID
+                if (tr->info.track_media_kind == e_video)
+                {
+                    flags  = 0x001;     // data-offset-present
+                    flags |= 0x100;     // sample-duration-present
+                    WR4(0x1010000);     // default_sample_flags
+                }
+                else
+                {
+                    WR4(duration);
+                }
+            MP4_END_ATOM
+            if (tr->info.track_media_kind == e_audio)
+            {
+                flags  = 0;
+                flags |= 0x001;         // data-offset-present
+                flags |= 0x200;         // sample-size-present
+                MP4_FULL_ATOM(BOX_trun, flags)
+                    WR4(1);             // sample_count
+                    pdata_offset = write_ptr; write_ptr += 4;   // save ptr to data_offset
+                    WR4(duration);      // sample_duration
+                MP4_END_ATOM
+            }
+            else if (kind == MP4E_SAMPLE_RANDOM_ACCESS)
+            {
+                flags  = 0;
+                flags |= 0x001;         // data-offset-present
+                flags |= 0x004;         // first-sample-flags-present
+                flags |= 0x100;         // sample-duration-present
+                flags |= 0x200;         // sample-size-present
+                MP4_FULL_ATOM(BOX_trun, flags)
+                    WR4(1);             // sample_count
+                    pdata_offset = write_ptr; write_ptr += 4;   // save ptr to data_offset
+                    WR4(0x2000000);     // first_sample_flags
+                    WR4(duration);      // sample_duration
+                    WR4(data_bytes);    // sample_size
+                MP4_END_ATOM
+            }
+            else
+            {
+                flags  = 0;
+                flags |= 0x001;         // data-offset-present
+                flags |= 0x100;         // sample-duration-present
+                flags |= 0x200;         // sample-size-present
+                MP4_FULL_ATOM(BOX_trun, flags)
+                    WR4(1);             // sample_count
+                    pdata_offset = write_ptr; write_ptr += 4;   // save ptr to data_offset
+                    WR4(duration);      // sample_duration
+                    WR4(data_bytes);    // sample_size
+                MP4_END_ATOM
+            }
+        MP4_END_ATOM
+    MP4_END_ATOM
+    MP4_WR4_PTR(pdata_offset, (write_ptr - write_base) + 8);
+
+    return mp4e_fwrite(mux, write_base, write_ptr - write_base);
 }
 
 /**
-*   Closes MP4 multiplexer
+*   Write file index 'moov' box with all its boxes and indexes
 */
-int MP4E__close(MP4E_mux_t * mux)
+static int mp4e_write_index(MP4E_mux_t * mux)
 {
     // atoms nesting stack
     unsigned char * stack_base[20];
@@ -483,10 +451,7 @@ int MP4E__close(MP4E_mux_t * mux)
     unsigned int ntr, index_bytes, ntracks;
     int i, error_code;
 
-    if (!mux) 
-    {
-        return MP4E_STATUS_BAD_ARGUMENTS;
-    }
+    mp4e_size_t mdat_end = mux->write_pos;
 
     ntracks = (unsigned int)(mux->tracks.bytes / sizeof(track_t));
     index_bytes = FILE_HEADER_BYTES;
@@ -511,23 +476,6 @@ int MP4E__close(MP4E_mux_t * mux)
         return MP4E_STATUS_NO_MEMORY;
     }
     write_ptr = write_base;
-
-#if MP4E_CAN_USE_RANDOM_FILE_ACCESS
-    {
-        // update size of mdat box.
-        // The only point, which requires random file access.
-        // This can be avoided using "till eof" size code, but in this case indexes must be 
-        // written before the mdat....
-        fpos_t endpos;
-        fgetpos(mux->mp4file, &endpos);
-        fseek(mux->mp4file, mux->mdat_start, SEEK_SET);
-        WR4(mux->write_pos - mux->mdat_start);
-        WR4(BOX_mdat);
-        mp4e_fwrite(mux, write_base, write_ptr - write_base);   // after that, mux->write_pos is no longer valid, and not needed
-        fsetpos(mux->mp4file, &endpos);
-        write_ptr = write_base;
-    }
-#endif
 
     // 
     // Write index atoms; order taken from Table 1 of [1]
@@ -576,7 +524,11 @@ int MP4E__close(MP4E_mux_t * mux)
         unsigned handler_type;
         const char * handler_ascii = NULL;
 
-        if (samples_count <= 0)
+        if (mux->enable_fragmentation)
+        {
+            samples_count = 0;
+        }
+        else if (samples_count <= 0)
         {
             continue;   // skip empty track
         }
@@ -839,10 +791,17 @@ int MP4E__close(MP4E_mux_t * mux)
 
                         // Sample To Chunk Box 
                         MP4_FULL_ATOM(BOX_stsc, 0);
-                        WR4(1); // entry_count
-                        WR4(1); // first_chunk;
-                        WR4(1); // samples_per_chunk;
-                        WR4(1); // sample_description_index;
+                        if (mux->enable_fragmentation)
+                        {
+                            WR4(0); // entry_count
+                        }
+                        else 
+                        {
+                            WR4(1); // entry_count
+                            WR4(1); // first_chunk;
+                            WR4(1); // samples_per_chunk;
+                            WR4(1); // sample_description_index;
+                        }
                         MP4_END_ATOM;
 
                         // Sample Size Box 
@@ -915,6 +874,29 @@ int MP4E__close(MP4E_mux_t * mux)
             MP4_END_ATOM;
         MP4_END_ATOM;
     }
+
+    if (mux->enable_fragmentation) 
+    {
+        track_t * tr = ((track_t*)mux->tracks.data) + 0;
+        unsigned movie_duration = mp4e_get_track_duration(tr);
+
+        MP4_ATOM(BOX_mvex);
+            MP4_FULL_ATOM(BOX_mehd, 0);
+                WR4(movie_duration);    // duration
+            MP4_END_ATOM;
+        for (ntr = 0; ntr < ntracks; ntr++)
+        {
+            MP4_FULL_ATOM(BOX_trex, 0);
+                WR4(ntr+1);             // track_ID
+                WR4(1);                 // default_sample_description_index
+                WR4(0);                 // default_sample_duration
+                WR4(0);                 // default_sample_size
+                WR4(0);                 // default_sample_flags 
+            MP4_END_ATOM;
+        }
+        MP4_END_ATOM;
+    }
+
     MP4_END_ATOM;   // moov atom
 
     assert((unsigned)(write_ptr - write_base) <= index_bytes);
@@ -928,11 +910,261 @@ int MP4E__close(MP4E_mux_t * mux)
         error_code = MP4E_STATUS_OK;
     }
     free(write_base);
-    free(mux->text_comment);
+
+
+#if MP4E_CAN_USE_RANDOM_FILE_ACCESS
+    if (!mux->enable_fragmentation) 
+    {
+        // update size of mdat box.
+        fseek(mux->mp4file, 0, SEEK_SET);
+        mp4e_write_mdat_box(mux, mdat_end - mp4e_write_file_header(mux));
+    }
+#endif
+
+    return error_code;
+}
+
+/************************************************************************/
+/*      Exported API functions                                          */
+/************************************************************************/
+
+/**
+*   Allocates and initialize mp4 multiplexer
+*   return multiplexer handle on success; NULL on failure
+*/
+MP4E_mux_t * MP4E__open(FILE * mp4file, int enable_fragmentation)
+{
+    MP4E_mux_t * mux;
+    if (!mp4file)
+    {
+        return NULL;
+    }
+
+    mux = (MP4E_mux_t *)calloc(sizeof(MP4E_mux_t), 1);
+    if (mux)
+    {
+        int success;
+        mux->mp4file = mp4file;
+        mux->enable_fragmentation = enable_fragmentation;
+        asp_vector_init(&mux->tracks, 2*sizeof(track_t));
+
+        success = !!mp4e_write_file_header(mux);
+#if MP4E_CAN_USE_RANDOM_FILE_ACCESS
+        if (!mux->enable_fragmentation)
+        {
+            success &= mp4e_write_mdat_box(mux, 0);    // Write stub, which would be updated later
+        }
+#endif
+        if (!success) 
+        {
+            mp4e_free(mux);
+            mux = NULL;
+        }
+    }
+
+    return mux;
+}
+
+/**
+*   Closes MP4 multiplexer
+*/
+int MP4E__close(MP4E_mux_t * mux)
+{
+    int error_code = MP4E_STATUS_OK;
+    if (!mux) 
+    {
+        return MP4E_STATUS_BAD_ARGUMENTS;
+    }
+
+    if (mux->enable_fragmentation)
+    {
+#if MP4E_CAN_USE_RANDOM_FILE_ACCESS
+        rewind(mux->mp4file);
+        mp4e_write_file_header(mux);
+        error_code = mp4e_write_index(mux);
+#endif
+    }
+    else
+    {
+        error_code = mp4e_write_index(mux);
+    }
     mp4e_free(mux);
 
     return error_code;
 }
+
+/**
+*   Add new track, return track ID
+*/
+int MP4E__add_track(MP4E_mux_t * mux, const MP4E_track_t * track_data)
+{
+    track_t *tr;
+
+    if (!mux || !track_data)
+    {
+        return MP4E_STATUS_BAD_ARGUMENTS;
+    }
+    if (mux->fragments_count)
+    {
+        return MP4E_STATUS_ENCODE_IN_PROGRESS;
+    }
+
+    tr = (track_t*)asp_vector_alloc_tail(&mux->tracks, sizeof(track_t));
+    if (!tr) 
+    {
+        return MP4E_STATUS_NO_MEMORY;
+    }
+    memset(tr, 0, sizeof(track_t));
+    memcpy(&tr->info, track_data, sizeof(*track_data));
+    if (!asp_vector_init(&tr->smpl, 256))
+    {
+        return MP4E_STATUS_NO_MEMORY;
+    }
+    asp_vector_init(&tr->vsps, 0);
+    asp_vector_init(&tr->vpps, 0);
+    return (int)(mux->tracks.bytes / sizeof(track_t)) - 1;
+}
+
+/**
+*   Set track DSI. Used for audio tracks.
+*/
+int MP4E__set_dsi(MP4E_mux_t * mux, int track_id, const void * dsi, int bytes)
+{
+    track_t* tr = ((track_t*)mux->tracks.data) + track_id;
+    assert(tr->info.track_media_kind == e_audio ||
+           tr->info.track_media_kind == e_private);
+    if (tr->vsps.bytes)
+    {
+        return MP4E_STATUS_ONLY_ONE_DSI_ALLOWED;   // only one DSI allowed
+    }
+    if (mux->fragments_count)
+    {
+        return MP4E_STATUS_ENCODE_IN_PROGRESS;
+    }
+    return mp4e_sps_pps_append_mem(&tr->vsps, dsi, bytes) ? MP4E_STATUS_OK : MP4E_STATUS_NO_MEMORY;
+}
+
+/**
+*   Set track SPS. Used for AVC video tracks.
+*/
+int MP4E__set_sps(MP4E_mux_t * mux, int track_id, const void * sps, int bytes)
+{
+    track_t* tr = ((track_t*)mux->tracks.data) + track_id;
+    assert(tr->info.track_media_kind == e_video);
+    if (mux->fragments_count)
+    {
+        return MP4E_STATUS_ENCODE_IN_PROGRESS;
+    }
+    return mp4e_sps_pps_append_mem(&tr->vsps, sps, bytes) ? MP4E_STATUS_OK : MP4E_STATUS_NO_MEMORY;
+}
+
+/**
+*   Set track PPS. Used for AVC video tracks.
+*/
+int MP4E__set_pps(MP4E_mux_t * mux, int track_id, const void * pps, int bytes)
+{
+    track_t* tr = ((track_t*)mux->tracks.data) + track_id;
+    assert(tr->info.track_media_kind == e_video);
+    if (mux->fragments_count)
+    {
+        return MP4E_STATUS_ENCODE_IN_PROGRESS;
+    }
+    return mp4e_sps_pps_append_mem(&tr->vpps, pps, bytes) ? MP4E_STATUS_OK : MP4E_STATUS_NO_MEMORY;
+}
+
+/**
+*   Add or remove MP4 file text comment according to Apple specs:
+*   https://developer.apple.com/library/mac/documentation/QuickTime/QTFF/Metadata/Metadata.html#//apple_ref/doc/uid/TP40000939-CH1-SW1
+*   http://atomicparsley.sourceforge.net/mpeg-4files.html
+*   note that ISO did not specify comment format.
+*/
+int MP4E__set_text_comment(MP4E_mux_t * mux, const char * comment)
+{
+    if (!mux)
+    {
+        return MP4E_STATUS_BAD_ARGUMENTS;
+    }
+    if (mux->fragments_count)
+    {
+        return MP4E_STATUS_ENCODE_IN_PROGRESS;
+    }
+
+    // replace comment
+    free(mux->text_comment);
+    mux->text_comment = NULL;
+    if (comment)
+    {
+        mux->text_comment = (char*)malloc(strlen(comment) + 1);
+        if (mux->text_comment)
+        {
+            strcpy(mux->text_comment, comment);
+        }
+    }
+    return MP4E_STATUS_OK;
+}
+
+/**
+*   Add new sample to specified track
+*/
+int MP4E__put_sample(MP4E_mux_t * mux, int track_num, const void * data, int data_bytes, int duration, int kind)
+{
+    if (!mux || !data || track_num*sizeof(track_t) >= mux->tracks.bytes)
+    {
+        return MP4E_STATUS_BAD_ARGUMENTS;
+    }
+
+    if (mux->enable_fragmentation)
+    {
+        if (!mux->fragments_count++)
+        {
+            // write file headers before 1st sample
+            int error_code = mp4e_write_index(mux);
+            if (error_code)
+            {
+                return error_code;
+            }
+        }
+
+        // write MOOF + MDAT + sample data
+        if (!mp4e_write_fragment_header(mux, track_num, data_bytes, duration, kind))
+        {
+            return MP4E_STATUS_FILE_WRITE_ERROR;
+        }
+
+        // write MDAT box for each sample
+        if (!mp4e_write_mdat_box(mux, data_bytes + 8))
+        {
+            return MP4E_STATUS_FILE_WRITE_ERROR;
+        }
+    }
+    else
+    {
+#if !MP4E_CAN_USE_RANDOM_FILE_ACCESS
+        // write MDAT box for each sample
+        if (!mp4e_write_mdat_box(mux, data_bytes + 8))
+        {
+            return MP4E_STATUS_FILE_WRITE_ERROR;
+        }
+#endif
+    }
+
+    // update file index (after optional MDAT)
+    // fragmented mode also may use optional index at the end of file (not yet implemented)
+    if (!mp4e_add_sample_descriptor(mux, ((track_t*)mux->tracks.data) + track_num, data_bytes, duration, kind))
+    {
+        return MP4E_STATUS_NO_MEMORY;
+    }
+
+    // write sample data
+    if (!mp4e_fwrite(mux, data, data_bytes))
+    {
+        return MP4E_STATUS_FILE_WRITE_ERROR;
+    }
+
+    return MP4E_STATUS_OK;
+}
+
+
 
 #ifdef mp4mux_test
 /******************************************************************************
@@ -996,12 +1228,12 @@ const unsigned char aac[] = {
 0x00, 0x00, 0x70
 };
 
-void test(FILE * output)
+void test(FILE * output, int fragmentation_mode)
 {
     int i, id_video, id_audio, id_private;
     static unsigned char dummy[100];
     // == Open file
-    MP4E_mux_t * mp4 = MP4E__open(output);
+    MP4E_mux_t * mp4 = MP4E__open(output, fragmentation_mode);
 
     // == Add audio track
     MP4E_track_t track;
@@ -1072,6 +1304,8 @@ int main(int argc, char* argv[])
 {
     FILE * file;
     char * output_file_name = (argc > 1)?argv[1]:"mp4mux_test.mp4";
+    int fragmentation_mode = (argc > 2)?argv[2][0] == 'f':0;
+
     if (!output_file_name)
     {
         printf("ERROR: no file name given!\n");
@@ -1083,7 +1317,7 @@ int main(int argc, char* argv[])
         printf("ERROR: can't open file %s!\n", output_file_name);
         return 1;
     }
-    test(file);
+    test(file, fragmentation_mode);
 
     return 0;
 }

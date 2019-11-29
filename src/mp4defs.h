@@ -64,7 +64,7 @@ enum
 /************************************************************************/
 /*      Complete box list (most of them not used here)                  */
 /************************************************************************/
-#define FOUR_CHAR_INT( a, b, c, d ) (((((((unsigned)(a)*256)|(b))*256)|(c))*256)|(d))
+#define FOUR_CHAR_INT( a, b, c, d ) (((a)<<24)|((b)<<16)|((c)<<8)|(d))
 enum
 {
     BOX_co64    = FOUR_CHAR_INT( 'c', 'o', '6', '4' ),//ChunkLargeOffsetAtomType
@@ -154,6 +154,7 @@ enum
     BOX_traf    = FOUR_CHAR_INT( 't', 'r', 'a', 'f' ),//TrackFragmentAtomType
     BOX_tfhd    = FOUR_CHAR_INT( 't', 'f', 'h', 'd' ),//TrackFragmentHeaderAtomType
     BOX_trun    = FOUR_CHAR_INT( 't', 'r', 'u', 'n' ),//TrackFragmentRunAtomType
+    BOX_mehd    = FOUR_CHAR_INT( 'm', 'e', 'h', 'd' ),//MovieExtendsHeaderBox
 
     // Object Descriptors (OD) data coding
     // These takes only 1 byte; this implementation translate <od_tag> to

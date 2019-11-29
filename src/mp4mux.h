@@ -23,6 +23,7 @@ extern "C" {
 #define MP4E_STATUS_NO_MEMORY               -2
 #define MP4E_STATUS_FILE_WRITE_ERROR        -3
 #define MP4E_STATUS_ONLY_ONE_DSI_ALLOWED    -4
+#define MP4E_STATUS_ENCODE_IN_PROGRESS      -5
 
 
 /************************************************************************/
@@ -90,9 +91,10 @@ typedef struct
 *
 *   Example:
 *
-*        MP4E_mux_t * mux = MP4E__open(fopen(input_file_name, "wb"));
+*        int enable_fragmentation = 0;
+*        MP4E_mux_t * mux = MP4E__open(fopen(input_file_name, "wb"), enable_fragmentation);
 */
-MP4E_mux_t * MP4E__open(FILE * mp4file);
+MP4E_mux_t * MP4E__open(FILE * mp4file, int enable_fragmentation);
 
 
 /**
